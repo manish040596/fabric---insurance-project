@@ -1,0 +1,126 @@
+from pyspark.sql.functions import *
+
+# ===============================
+# 1. LOAD RAW DATA (Bronze Layer)
+# ===============================
+df_customers = spark.read.option("header", True).csv("/lakehouse/default/Files/raw/customers.csv")
+df_policies  = spark.read.option("header", True).csv("/lakehouse/default/Files/raw/policies.csv")
+df_claims    = spark.read.option("header", True).csv("/lakehouse/default/Files/raw/claims.csv")
+
+# =====================================
+# 2. CLEANING INDIVIDUAL TABLES
+# =====================================
+df_customers_clean = (
+    df_customers
+    .drop("_c5")
+    .dropna(subset=["cust_id"])
+    .withColumn("cust_id", col("cust_id").cast("int"))
+    .withColumn("CustomerName", initcap(trim(col("Full Name"))))
+    .withColumn("Date_of_Birth", to_date(col("Date_of_Birth")))
+    .withColumn("Contact", when(col("Contact").isNull(), "Not Provided").otherwise(col("Contact")))
+    .drop("Full Name")
+    .dropDuplicates()
+)
+
+df_policies_clean = (
+    df_policies
+    .withColumn("policy_Type", initcap(trim(col("policy_Type"))))
+    .withColumn("status", initcap(trim(col("status"))))
+    .withColumn("Start_Date", to_date(regexp_replace(col("Start_Date"), "/", "-")))
+    .withColumn("Coverage_Amount", when(col("Coverage_Amount") == "not available", None)
+                .otherwise(col("Coverage_Amount").cast("double")))
+    .withColumn("cust_id", col("cust_id").cast("int"))
+    .dropna(subset=["cust_id", "policy_id"])
+)
+
+df_claims_clean = (
+    df_claims
+    .withColumn("claim_date", to_date(col("claim_date")))
+    .withColumn("claim_amount", col("claim_amount").cast("double"))
+    .withColumn("status", initcap(trim(col("status"))))
+    .dropna(subset=["policy_id"])
+)
+
+# =============================================
+# 3. JOIN + AGGREGATE IN SILVER (Unified Table)
+# =============================================
+df_joined = (
+    df_claims_clean.alias("c")
+    .join(df_policies_clean.alias("p"), col("c.policy_id") == col("p.policy_id"), "inner")
+    .join(df_customers_clean.alias("cu"), col("p.cust_id") == col("cu.cust_id"), "inner")
+)
+
+df_aggregated = (
+    df_joined.groupBy("cu.cust_id", "cu.CustomerName", "cu.Gender")
+    .agg(
+        count("c.claim_id").alias("TotalClaims"),
+        count(when(lower(col("c.status")) == "approved", True)).alias("ApprovedClaims"),
+        count(when(lower(col("c.status")) == "rejected", True)).alias("RejectedClaims"),
+        round(sum("c.claim_amount"), 2).alias("TotalClaimAmount"),
+        round(avg("c.claim_amount"), 2).alias("AvgClaimAmount"),
+        collect_set(lower(col("p.policy_type"))).alias("PolicyTypesArray"),
+        round(sum("p.coverage_amount"), 2).alias("TotalCoverageAmount"),
+        min("c.claim_date").alias("FirstClaimDate"),
+        max("c.claim_date").alias("LastClaimDate")
+    )
+    .withColumn("PolicyTypes", concat_ws(", ", col("PolicyTypesArray")))
+    .withColumn(
+        "ClaimToCoverageRatio",
+        round((col("TotalClaimAmount") / col("TotalCoverageAmount")) * 100, 2)
+    )
+    .drop("PolicyTypesArray")
+)
+
+# SAVE the cleaned+enriched silver output
+df_aggregated.write.mode("overwrite").format("delta").save("/lakehouse/default/Files/silver/customer_claim_summary_enriched")
+
+# ALSO: Create a temporary view for visualization
+df_aggregated.createOrReplaceTempView("enriched_customer_summary")
+
+
+
+
+--------------------------------------------------------------------
+
+KPI
+Top 10 High-Value Customers by Claim Amount
+display(spark.sql("""
+SELECT CustomerName, TotalClaimAmount
+FROM enriched_customer_summary
+ORDER BY TotalClaimAmount DESC
+LIMIT 10
+"""))
+
+ 2. Claim Approval Rate by Gender
+display(spark.sql("""
+SELECT Gender,
+       ApprovedClaims,
+       RejectedClaims,
+       ROUND(ApprovedClaims * 100.0 / TotalClaims, 2) AS ApprovalRate
+FROM enriched_customer_summary
+"""))
+
+
+✅ 3. Claim to Coverage Ratio Distribution
+display(spark.sql("""
+SELECT CustomerName, ClaimToCoverageRatio
+FROM enriched_customer_summary
+WHERE ClaimToCoverageRatio IS NOT NULL
+ORDER BY ClaimToCoverageRatio DESC
+"""))
+
+
+✅ 4. Claims by Policy Types (Explode for Analysis)
+from pyspark.sql.functions import explode, split
+
+df_policy_split = (
+    df_aggregated
+    .withColumn("PolicyType", explode(split(col("PolicyTypes"), ",\\s*")))
+    .groupBy("PolicyType")
+    .agg(count("*").alias("CustomerCount"))
+)
+
+display(df_policy_split)
+ 
+
+
